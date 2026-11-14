@@ -63,6 +63,7 @@ from .tool_context import ToolContext
 from .util import _transforms
 from .util._asyncio_tasks import gather_with_cancel, run_producer_consumer
 from .util._types import MaybeAwaitable
+from .run_internal.delegation_context import enter_agent_tool_delegation, get_current_delegation_depth
 
 if TYPE_CHECKING:
     from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
@@ -639,6 +640,7 @@ class Agent(AgentBase, Generic[TContext]):
         on_stream: Callable[[AgentToolStreamEvent], MaybeAwaitable[None]] | None = None,
         run_config: RunConfig | dict[str, Any] | None = None,
         max_turns: int | None = None,
+        max_delegation_depth: int | None = None,
         hooks: RunHooks[TContext] | None = None,
         previous_response_id: str | None = None,
         conversation_id: str | None = None,
@@ -781,6 +783,14 @@ class Agent(AgentBase, Generic[TContext]):
             resolved_run_config = run_config
             if resolved_run_config is None and isinstance(context, ToolContext):
                 resolved_run_config = context.run_config
+            resolved_max_delegation_depth = max_delegation_depth
+            if resolved_max_delegation_depth is None and resolved_run_config is not None:
+                if isinstance(resolved_run_config, dict):
+                    resolved_max_delegation_depth = resolved_run_config.get("max_delegation_depth")
+                else:
+                    resolved_max_delegation_depth = getattr(
+                        resolved_run_config, "max_delegation_depth", None
+                    )
             tool_state_scope_id = get_agent_tool_state_scope(context)
             if isinstance(context, ToolContext):
                 # Use a fresh ToolContext to avoid sharing approval state with parent runs.
@@ -951,137 +961,138 @@ class Agent(AgentBase, Generic[TContext]):
                     resume_state._context.usage = context.usage
 
             if run_result is None:
-                if on_stream is not None:
-                    stream_handler = on_stream
-                    run_result_streaming = Runner.run_streamed(
-                        starting_agent=cast(Agent[Any], self),
-                        input=resume_state if resume_state is not None else resolved_input,
-                        # On resume, pass the parent application context so
-                        # resolve_resumed_context can update the nested restored
-                        # wrapper's .context without dropping nested approvals.
-                        context=cast(Any, nested_context),
-                        run_config=resolved_run_config,
-                        max_turns=resolved_max_turns,
-                        hooks=hooks,
-                        previous_response_id=None
-                        if resume_state is not None
-                        else previous_response_id,
-                        conversation_id=None if resume_state is not None else conversation_id,
-                        session=session,
-                    )
-                    # Keep callbacks decoupled from event consumption within a bounded backlog.
-                    # Reserve one extra slot for completion, including on failure/cancellation.
-                    event_queue: asyncio.Queue[AgentToolStreamEvent | None] = asyncio.Queue(
-                        maxsize=on_stream_max_pending_events + 1
-                        if on_stream_max_pending_events is not None
-                        else 0
-                    )
-                    stream_events = cast(
-                        AsyncGenerator["StreamEvent", None], run_result_streaming.stream_events()
-                    )
-
-                    async def _run_handler(payload: AgentToolStreamEvent) -> None:
-                        """Execute the user callback while capturing exceptions."""
-                        try:
-                            maybe_result = stream_handler(payload)
-                            if inspect.isawaitable(maybe_result):
-                                await maybe_result
-                        except Exception as exc:
-
-                            def diagnostic_extra() -> dict[str, object]:
-                                return {"agent_name": self.name}
-
-                            log_model_and_tool_action_error(
-                                logger,
-                                "Error while handling an agent tool on_stream event",
-                                exc,
-                                diagnostic_extra=diagnostic_extra,
-                            )
-
-                    async def dispatch_stream_events() -> None:
-                        while True:
-                            payload = await event_queue.get()
-                            is_sentinel = payload is None  # None marks the end of the stream.
-                            try:
-                                if payload is not None:
-                                    await _run_handler(payload)
-                            finally:
-                                event_queue.task_done()
-
-                            if is_sentinel:
-                                break
-
-                    async def enqueue_stream_events() -> None:
-                        from .stream_events import AgentUpdatedStreamEvent
-
-                        current_agent = run_result_streaming.current_agent
-                        try:
-                            async for event in stream_events:
-                                if isinstance(event, AgentUpdatedStreamEvent):
-                                    current_agent = event.new_agent
-
-                                payload: AgentToolStreamEvent = {
-                                    "event": event,
-                                    "agent": current_agent,
-                                    "tool_call": context.tool_call,
-                                }
-                                if (
-                                    on_stream_max_pending_events is not None
-                                    and event_queue.qsize() >= on_stream_max_pending_events
-                                ):
-                                    # A burst of ready events must let a ready callback catch up.
-                                    await asyncio.sleep(0)
-                                    if event_queue.qsize() >= on_stream_max_pending_events:
-                                        raise _AgentToolStreamOverflow(
-                                            "Agent tool on_stream backlog exceeded "
-                                            "on_stream_max_pending_events="
-                                            f"{on_stream_max_pending_events}. "
-                                            "Use a faster handler, increase the limit, "
-                                            "or set it to None."
-                                        )
-                                event_queue.put_nowait(payload)
-                        finally:
-                            event_queue.put_nowait(None)
-
-                    try:
-                        await run_producer_consumer(
-                            enqueue_stream_events(),
-                            dispatch_stream_events(),
-                            fail_fast_exceptions=(_AgentToolStreamOverflow,),
-                            # Stop upstream work before awaiting callback cancellation cleanup.
-                            on_failure=lambda: run_result_streaming.cancel(),
+                with enter_agent_tool_delegation(resolved_max_delegation_depth):
+                    if on_stream is not None:
+                        stream_handler = on_stream
+                        run_result_streaming = Runner.run_streamed(
+                            starting_agent=cast(Agent[Any], self),
+                            input=resume_state if resume_state is not None else resolved_input,
+                            # On resume, pass the parent application context so
+                            # resolve_resumed_context can update the nested restored
+                            # wrapper's .context without dropping nested approvals.
+                            context=cast(Any, nested_context),
+                            run_config=resolved_run_config,
+                            max_turns=resolved_max_turns,
+                            hooks=hooks,
+                            previous_response_id=None
+                            if resume_state is not None
+                            else previous_response_id,
+                            conversation_id=None if resume_state is not None else conversation_id,
+                            session=session,
                         )
-                    except BaseException:
-                        # Cancellation can interrupt the producer between iterator advances.
-                        # Explicitly close the iterator after its owning task has stopped.
+                        # Keep callbacks decoupled from event consumption within a bounded backlog.
+                        # Reserve one extra slot for completion, including on failure/cancellation.
+                        event_queue: asyncio.Queue[AgentToolStreamEvent | None] = asyncio.Queue(
+                            maxsize=on_stream_max_pending_events + 1
+                            if on_stream_max_pending_events is not None
+                            else 0
+                        )
+                        stream_events = cast(
+                            AsyncGenerator["StreamEvent", None], run_result_streaming.stream_events()
+                        )
+
+                        async def _run_handler(payload: AgentToolStreamEvent) -> None:
+                            """Execute the user callback while capturing exceptions."""
+                            try:
+                                maybe_result = stream_handler(payload)
+                                if inspect.isawaitable(maybe_result):
+                                    await maybe_result
+                            except Exception as exc:
+
+                                def diagnostic_extra() -> dict[str, object]:
+                                    return {"agent_name": self.name}
+
+                                log_model_and_tool_action_error(
+                                    logger,
+                                    "Error while handling an agent tool on_stream event",
+                                    exc,
+                                    diagnostic_extra=diagnostic_extra,
+                                    )
+
+                        async def dispatch_stream_events() -> None:
+                            while True:
+                                payload = await event_queue.get()
+                                is_sentinel = payload is None  # None marks the end of the stream.
+                                try:
+                                    if payload is not None:
+                                        await _run_handler(payload)
+                                finally:
+                                    event_queue.task_done()
+
+                                if is_sentinel:
+                                    break
+
+                        async def enqueue_stream_events() -> None:
+                            from .stream_events import AgentUpdatedStreamEvent
+
+                            current_agent = run_result_streaming.current_agent
+                            try:
+                                async for event in stream_events:
+                                    if isinstance(event, AgentUpdatedStreamEvent):
+                                        current_agent = event.new_agent
+
+                                    payload: AgentToolStreamEvent = {
+                                        "event": event,
+                                        "agent": current_agent,
+                                        "tool_call": context.tool_call,
+                                    }
+                                    if (
+                                        on_stream_max_pending_events is not None
+                                        and event_queue.qsize() >= on_stream_max_pending_events
+                                    ):
+                                        # A burst of ready events must let a ready callback catch up.
+                                        await asyncio.sleep(0)
+                                        if event_queue.qsize() >= on_stream_max_pending_events:
+                                            raise _AgentToolStreamOverflow(
+                                                "Agent tool on_stream backlog exceeded "
+                                                "on_stream_max_pending_events="
+                                                f"{on_stream_max_pending_events}. "
+                                                "Use a faster handler, increase the limit, "
+                                                "or set it to None."
+                                            )
+                                    event_queue.put_nowait(payload)
+                            finally:
+                                event_queue.put_nowait(None)
+
                         try:
-                            await stream_events.aclose()
-                        except BaseException as close_error:
-                            # Cleanup cancellation must not replace the primary failure either.
-                            log_model_and_tool_action_error(
-                                logger,
-                                "Error while closing an agent tool stream after failure",
-                                close_error,
+                            await run_producer_consumer(
+                                enqueue_stream_events(),
+                                dispatch_stream_events(),
+                                fail_fast_exceptions=(_AgentToolStreamOverflow,),
+                                # Stop upstream work before awaiting callback cancellation cleanup.
+                                on_failure=lambda: run_result_streaming.cancel(),
                             )
-                        raise
-                    run_result = run_result_streaming
-                else:
-                    run_result = await Runner.run(
-                        starting_agent=cast(Agent[Any], self),
-                        input=resume_state if resume_state is not None else resolved_input,
-                        # On resume, pass the parent application context so
-                        # resolve_resumed_context can update the nested restored
-                        # wrapper's .context without dropping nested approvals.
-                        context=cast(Any, nested_context),
-                        run_config=resolved_run_config,
-                        max_turns=resolved_max_turns,
-                        hooks=hooks,
-                        previous_response_id=None
-                        if resume_state is not None
-                        else previous_response_id,
-                        conversation_id=None if resume_state is not None else conversation_id,
-                        session=session,
-                    )
+                        except BaseException:
+                            # Cancellation can interrupt the producer between iterator advances.
+                            # Explicitly close the iterator after its owning task has stopped.
+                            try:
+                                await stream_events.aclose()
+                            except BaseException as close_error:
+                                # Cleanup cancellation must not replace the primary failure either.
+                                log_model_and_tool_action_error(
+                                    logger,
+                                    "Error while closing an agent tool stream after failure",
+                                    close_error,
+                                )
+                            raise
+                        run_result = run_result_streaming
+                    else:
+                        run_result = await Runner.run(
+                            starting_agent=cast(Agent[Any], self),
+                            input=resume_state if resume_state is not None else resolved_input,
+                            # On resume, pass the parent application context so
+                            # resolve_resumed_context can update the nested restored
+                            # wrapper's .context without dropping nested approvals.
+                            context=cast(Any, nested_context),
+                            run_config=resolved_run_config,
+                            max_turns=resolved_max_turns,
+                            hooks=hooks,
+                            previous_response_id=None
+                            if resume_state is not None
+                            else previous_response_id,
+                            conversation_id=None if resume_state is not None else conversation_id,
+                            session=session,
+                        )
             assert run_result is not None
 
             # Store the run result by tool call identity so nested interruptions can be read later.

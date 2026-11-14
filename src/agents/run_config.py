@@ -521,6 +521,15 @@ class RunConfig:
     output and guardrail ``output_info`` are never passed to the formatter.
     """
 
+    max_delegation_depth: int | None = None
+    """Maximum allowed recursion/nesting depth for nested agents invoked via `Agent.as_tool()`.
+
+    - ``None`` (default): Unlimited delegation depth.
+    - ``0``: Forbids any nested agent execution via `Agent.as_tool()`.
+    - ``1``: Allows the top-level agent to invoke sub-agents, but prevents those sub-agents from
+      delegating to further agents.
+    """
+
     if TYPE_CHECKING:
 
         def __init__(
@@ -552,9 +561,12 @@ class RunConfig:
             output_guardrail_blocked_message: (
                 str | OutputGuardrailBlockedMessageFormatter | None
             ) = None,
+            max_delegation_depth: int | None = None,
         ) -> None: ...
 
     def __post_init__(self) -> None:
+        if self.max_delegation_depth is not None and self.max_delegation_depth < 0:
+            raise ValueError("max_delegation_depth must be non-negative or None")
         if self.tool_name_collision_policy not in ("warn", "error"):
             raise ValueError("tool_name_collision_policy must be either 'warn' or 'error'")
         blocked_message = self.output_guardrail_blocked_message

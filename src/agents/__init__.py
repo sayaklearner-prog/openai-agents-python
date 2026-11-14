@@ -21,6 +21,7 @@ from .editor import ApplyPatchEditor, ApplyPatchOperation, ApplyPatchResult
 from .exceptions import (
     AgentsException,
     InputGuardrailTripwireTriggered,
+    MaxDelegationDepthExceeded,
     MaxTurnsExceeded,
     MCPToolCancellationError,
     ModelBehaviorError,
@@ -413,6 +414,7 @@ __all__ = [
     "DynamicPromptFunction",
     "GenerateDynamicPromptData",
     "Prompt",
+    "MaxDelegationDepthExceeded",
     "MaxTurnsExceeded",
     "MCPToolCancellationError",
     "ModelBehaviorError",

@@ -361,6 +361,20 @@ class MaxTurnsExceeded(AgentsException):
         super().__init__(message)
 
 
+class MaxDelegationDepthExceeded(AgentsException):
+    """Exception raised when nested Agent.as_tool() invocations exceed max_delegation_depth."""
+
+    message: str
+    current_depth: int
+    max_depth: int
+
+    def __init__(self, message: str, *, current_depth: int, max_depth: int):
+        self.message = message
+        self.current_depth = current_depth
+        self.max_depth = max_depth
+        super().__init__(message)
+
+
 class ModelBehaviorError(AgentsException):
     """Exception raised when the model does something unexpected, e.g. calling a tool that doesn't
     exist, or providing malformed JSON.
