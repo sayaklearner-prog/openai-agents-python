@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
@@ -50,6 +51,18 @@ from .reasoning_content_replay import ShouldReplayReasoningContent
 
 if TYPE_CHECKING:
     from ..model_settings import ModelSettings
+
+_REASONING_MODEL_REGEX = re.compile(r"^(o[1-9]|gpt-5)", re.IGNORECASE)
+
+
+def _is_reasoning_model(model_name: str | None) -> bool:
+    """Check if the model name belongs to an OpenAI reasoning family requiring max_completion_tokens."""
+    if not model_name:
+        return False
+    trimmed = model_name.strip().rsplit("/", 1)[-1]
+    if trimmed.startswith("ft:"):
+        trimmed = trimmed[3:].split(":", 1)[0]
+    return bool(_REASONING_MODEL_REGEX.match(trimmed))
 
 
 class OpenAIChatCompletionsModel(Model):
@@ -698,6 +711,31 @@ class OpenAIChatCompletionsModel(Model):
 
         stream_param: Literal[True] | Omit = True if stream else omit
 
+        is_official_openai = ChatCmplHelpers.is_openai(self._get_client())
+        use_max_completion_tokens = is_official_openai and _is_reasoning_model(self.model)
+
+        extra_args = model_settings.extra_args or {}
+        has_extra_max_tokens = "max_tokens" in extra_args
+        has_extra_max_completion_tokens = "max_completion_tokens" in extra_args
+
+        # Resolve token limit parameter mapping.
+        # - Official OpenAI reasoning models require max_completion_tokens.
+        # - Third-party endpoints and non-reasoning models preserve max_tokens.
+        # - Explicitly supplied extra_args["max_completion_tokens"] takes precedence over
+        #   auto-mapping from model_settings.max_tokens.
+        # - Supplying max_tokens in both model_settings and extra_args triggers duplicate-key validation.
+        max_tokens_param: int | Omit = omit
+        max_completion_tokens_param: int | Omit = omit
+
+        if model_settings.max_tokens is not None:
+            if use_max_completion_tokens:
+                if has_extra_max_tokens:
+                    max_tokens_param = model_settings.max_tokens
+                elif not has_extra_max_completion_tokens:
+                    max_completion_tokens_param = model_settings.max_tokens
+            else:
+                max_tokens_param = model_settings.max_tokens
+
         create_kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": converted_messages,
@@ -706,7 +744,8 @@ class OpenAIChatCompletionsModel(Model):
             "top_p": self._non_null_or_omit(model_settings.top_p),
             "frequency_penalty": self._non_null_or_omit(model_settings.frequency_penalty),
             "presence_penalty": self._non_null_or_omit(model_settings.presence_penalty),
-            "max_tokens": self._non_null_or_omit(model_settings.max_tokens),
+            "max_tokens": self._non_null_or_omit(max_tokens_param),
+            "max_completion_tokens": self._non_null_or_omit(max_completion_tokens_param),
             "tool_choice": tool_choice,
             "response_format": response_format,
             "parallel_tool_calls": parallel_tool_calls,
